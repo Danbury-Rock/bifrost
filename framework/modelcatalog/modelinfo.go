@@ -9,21 +9,28 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
-// ModelCatalog implements schemas.ModelInfoProvider, which is what backs
-// ctx.GetModelInfo / ctx.CalculateCost inside plugin hooks. Core cannot import
-// this package (framework depends on core, not the reverse), so the wiring is
-// an interface assertion here plus a Bifrost.SetModelCatalog call at boot.
-var _ schemas.ModelInfoProvider = (*ModelCatalog)(nil)
-
-// GetModelInfo returns pricing and capability metadata for a (provider, model)
-// pair in the same shape the /v1/models endpoint reports, or nil when the
-// catalog has no entry for it.
+// GetModelInfo returns metadata for a (provider, model) pair in the same shape
+// the /v1/models endpoint reports, or nil when nothing is known about it.
 //
-// Lookup order is pricing-row first (exact model+provider across every request
-// mode), then the capability entry, which additionally resolves through the
-// canonical base model and the wider model family. That ordering keeps dated
-// model IDs like "gpt-4o-2024-08-06" resolvable even when only the family row
-// carries capability data.
+// Composed from both halves of the catalog, the way /v1/models composes them:
+// start from what the provider most recently reported, then let the datasheet
+// fill in what the provider left out. Since ApplyModelInfo only writes fields
+// that are still nil, that order is the precedence — provider-reported wins.
+// Reading the datasheet alone would return nil for every model a provider has
+// started serving that the datasheet has no row for yet.
+//
+// The datasheet half resolves pricing-row first (exact model+provider across
+// every request mode), then the capability entry, which additionally resolves
+// through the canonical base model and the wider model family. That ordering
+// keeps dated model IDs like "gpt-4o-2024-08-06" resolvable even when only the
+// family row carries capability data.
+//
+// Describes the model; does not authorize it. Key scope is ignored on purpose:
+// a model's context window and price do not depend on which key reaches it, and
+// a non-nil result says nothing about whether a request may route there.
+//
+// nil means what it means to /v1/models — nothing beyond the identifier is
+// known, so there is nothing to act on. See schemas.Model.HasMetadata.
 //
 // The returned *schemas.Model is freshly allocated and owned by the caller.
 func (mc *ModelCatalog) GetModelInfo(provider schemas.ModelProvider, model string) *schemas.Model {
@@ -31,19 +38,26 @@ func (mc *ModelCatalog) GetModelInfo(provider schemas.ModelProvider, model strin
 		return nil
 	}
 
+	info := &schemas.Model{ID: model}
+	if live, ok := mc.live.FindModel(provider, model); ok {
+		*info = live
+		// The cached identifier may be provider-prefixed; answer in the
+		// caller's spelling.
+		info.ID = model
+	}
+
 	entry := mc.datasheet.GetPricingEntryForModel(model, provider)
 	if entry == nil {
 		entry = mc.datasheet.GetCapabilityEntry(model, provider)
 	}
-	if entry == nil {
-		return nil
-	}
-
-	info := &schemas.Model{ID: model}
 	ApplyModelInfo(info, entry)
 
-	if params := mc.datasheet.GetSupportedParameters(model); len(params) > 0 {
-		info.SupportedParameters = params
+	if len(info.SupportedParameters) == 0 {
+		info.SupportedParameters = mc.datasheet.GetSupportedParameters(model)
+	}
+
+	if !info.HasMetadata() {
+		return nil
 	}
 	return info
 }
@@ -72,7 +86,7 @@ func ApplyModelInfo(model *schemas.Model, entry *PricingEntry) {
 	model.IsDeprecated = model.IsDeprecated || entry.IsDeprecated
 
 	if entry.BaseModel != "" && model.NormalizedName == nil {
-		model.NormalizedName = ptr(providerUtils.NormalizeBaseModelSlug(entry.BaseModel))
+		model.NormalizedName = new(providerUtils.NormalizeBaseModelSlug(entry.BaseModel))
 	}
 	if len(entry.AdditionalAttributes) > 0 && model.AdditionalAttributes == nil {
 		// A shallow clone is the right depth here: the values are strings, which
@@ -107,22 +121,22 @@ func ApplyModelInfo(model *schemas.Model, entry *PricingEntry) {
 	}
 	pricing := &schemas.Pricing{}
 	if entry.InputCostPerToken != nil {
-		pricing.Prompt = ptr(formatCost(*entry.InputCostPerToken))
+		pricing.Prompt = new(formatCost(*entry.InputCostPerToken))
 	}
 	if entry.OutputCostPerToken != nil {
-		pricing.Completion = ptr(formatCost(*entry.OutputCostPerToken))
+		pricing.Completion = new(formatCost(*entry.OutputCostPerToken))
 	}
 	if entry.InputCostPerImage != nil {
-		pricing.Image = ptr(formatCost(*entry.InputCostPerImage))
+		pricing.Image = new(formatCost(*entry.InputCostPerImage))
 	}
 	if entry.CacheReadInputTokenCost != nil {
-		pricing.InputCacheRead = ptr(formatCost(*entry.CacheReadInputTokenCost))
+		pricing.InputCacheRead = new(formatCost(*entry.CacheReadInputTokenCost))
 	}
 	if entry.CacheCreationInputTokenCost != nil {
-		pricing.InputCacheWrite = ptr(formatCost(*entry.CacheCreationInputTokenCost))
+		pricing.InputCacheWrite = new(formatCost(*entry.CacheCreationInputTokenCost))
 	}
 	if entry.SearchContextCostPerQuery != nil {
-		pricing.WebSearch = ptr(formatCost(*entry.SearchContextCostPerQuery))
+		pricing.WebSearch = new(formatCost(*entry.SearchContextCostPerQuery))
 	}
 	model.Pricing = pricing
 }
@@ -153,8 +167,4 @@ func (mc *ModelCatalog) CalculateRequestCost(ctx *schemas.BifrostContext, resp *
 // scientific notation, which clients parsing these as decimals choke on.
 func formatCost(v float64) string {
 	return fmt.Sprintf("%.10f", v)
-}
-
-func ptr[T any](v T) *T {
-	return &v
 }
