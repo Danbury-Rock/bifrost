@@ -18,6 +18,21 @@ import (
 // classification. It mirrors the signature of bifrost.Client.EmbeddingRequest.
 type EmbeddingRequestExecutor func(ctx *schemas.BifrostContext, req *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError)
 
+// routingEmbedUsageContextKey carries a *routingEmbedUsage on the triggering
+// request's context from classification (PreRequestHook) to PostLLMHook, where
+// it is stamped onto the response as ExtraFields.RoutingDebug. It mirrors the
+// semantic cache's per-request state handoff between its pre and post hooks.
+const routingEmbedUsageContextKey schemas.BifrostContextKey = "bf-governance-routing-embed-usage"
+
+// routingEmbedUsage is the recorded usage of one semantic classification
+// embedding call made on behalf of a request.
+type routingEmbedUsage struct {
+	Provider           string
+	Model              string
+	InputTokens        int
+	CountTowardBudgets bool
+}
+
 // EmbeddingExecutorSetter is implemented by governance plugins that accept an
 // embedding request executor. The HTTP server wires the executor after the
 // bifrost client is constructed (the plugin itself is built while the client
@@ -25,6 +40,23 @@ type EmbeddingRequestExecutor func(ctx *schemas.BifrostContext, req *schemas.Bif
 // embed *GovernancePlugin satisfy this via method promotion.
 type EmbeddingExecutorSetter interface {
 	SetEmbeddingRequestExecutor(EmbeddingRequestExecutor)
+}
+
+// WarmupEmbedUsageObserver receives the usage of every warmup/boot embedding
+// call made by semantic complexity routing. Warmup embeds have no triggering
+// request — there is no response to stamp — so this callback is how their cost
+// reaches telemetry. The HTTP server wires it to the telemetry plugin's routing
+// overhead counters. Budget attribution is separate: settleWarmupEmbedUsage
+// bills the admin-owned provider/model-level budgets directly when
+// count_toward_budgets is on.
+type WarmupEmbedUsageObserver func(provider, model string, inputTokens int)
+
+// WarmupEmbedUsageObserverSetter is implemented by governance plugins that
+// accept a warmup embedding usage observer. Wired by the HTTP server like
+// EmbeddingExecutorSetter; wrappers that embed *GovernancePlugin satisfy this
+// via method promotion.
+type WarmupEmbedUsageObserverSetter interface {
+	SetWarmupEmbedUsageObserver(WarmupEmbedUsageObserver)
 }
 
 // ComplexityVectorStoreSetter is implemented by governance plugins that accept
@@ -61,26 +93,85 @@ func (p *GovernancePlugin) SetComplexityVectorStore(store vectorstore.VectorStor
 }
 
 // embedComplexityText adapts Governance's Bifrost-aware embedding path to the
-// classifier's context-based dependency without attributing token usage here.
+// classifier's context-based dependency. It records the embed's usage on the
+// triggering request's context so PostLLMHook can stamp RoutingDebug; budget
+// attribution itself happens later in cost calculation, never here.
 func (p *GovernancePlugin) embedComplexityText(ctx context.Context, semantic *complexity.SemanticConfig, text string) ([]float32, error) {
 	embeddingCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
 	defer embeddingCtx.Cancel()
-	embedding, _, err := p.generateEmbedding(embeddingCtx, semantic, text)
+	embedding, inputTokens, err := p.generateEmbedding(embeddingCtx, semantic, text)
 	if err != nil {
 		return nil, err
+	}
+	if _, isRequest := ctx.(*schemas.BifrostContext); isRequest {
+		recordRoutingEmbedUsage(ctx, semantic, inputTokens)
+	} else {
+		// A plain context means warmup's single-input fallback (batch embeds
+		// unsupported by the provider/model), not a classification request.
+		p.settleWarmupEmbedUsage(semantic, inputTokens)
 	}
 	return embedding, nil
 }
 
+// recordRoutingEmbedUsage stashes one classification embed's usage on the
+// triggering request's context. Warmup embeds arrive on plain background
+// contexts (never a *schemas.BifrostContext), so they are naturally excluded —
+// boot/warmup embedding cost is never stamped or attributed to any request.
+func recordRoutingEmbedUsage(ctx context.Context, semantic *complexity.SemanticConfig, inputTokens int) {
+	bfCtx, ok := ctx.(*schemas.BifrostContext)
+	if !ok || semantic == nil {
+		return
+	}
+	bfCtx.SetValue(routingEmbedUsageContextKey, &routingEmbedUsage{
+		Provider:           string(semantic.Provider),
+		Model:              semantic.EmbeddingModel,
+		InputTokens:        inputTokens,
+		CountTowardBudgets: semantic.CountTowardBudgets,
+	})
+}
+
+// stampRoutingDebug attaches routing-classification telemetry to the response
+// when this request ran a semantic routing embed. Stamped on every such
+// response for visibility, independent of count_toward_budgets — the flag rides
+// in the struct because cost calculation (modelcatalog) cannot see governance
+// config. For streams, only the final chunk is stamped, matching where cost is
+// billed and mirroring the semantic cache's stamping.
+func stampRoutingDebug(ctx *schemas.BifrostContext, result *schemas.BifrostResponse, requestType schemas.RequestType, isFinalChunk bool) {
+	if result == nil {
+		return
+	}
+	if bifrost.IsStreamRequestType(requestType) && !isFinalChunk {
+		return
+	}
+	usage, ok := ctx.Value(routingEmbedUsageContextKey).(*routingEmbedUsage)
+	if !ok || usage == nil {
+		return
+	}
+	extraFields := result.GetExtraFields()
+	if extraFields == nil {
+		return
+	}
+	inputTokens := usage.InputTokens
+	extraFields.RoutingDebug = &schemas.BifrostRoutingDebug{
+		ProviderUsed:       bifrost.Ptr(usage.Provider),
+		ModelUsed:          bifrost.Ptr(usage.Model),
+		InputTokens:        &inputTokens,
+		CountTowardBudgets: usage.CountTowardBudgets,
+	}
+}
+
 // embedComplexityTexts adapts the same internal embedding path for bounded
-// warmup batches. It preserves response order by EmbeddingData.Index.
+// warmup batches. It preserves response order by EmbeddingData.Index. Batch
+// embeds are warmup-only, so usage always goes to the warmup observer and is
+// never attributed to a request.
 func (p *GovernancePlugin) embedComplexityTexts(ctx context.Context, semantic *complexity.SemanticConfig, texts []string) ([][]float32, error) {
 	embeddingCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
 	defer embeddingCtx.Cancel()
-	embeddings, _, err := p.generateEmbeddings(embeddingCtx, semantic, texts)
+	embeddings, inputTokens, err := p.generateEmbeddings(embeddingCtx, semantic, texts)
 	if err != nil {
 		return nil, err
 	}
+	p.settleWarmupEmbedUsage(semantic, inputTokens)
 	return embeddings, nil
 }
 
@@ -90,6 +181,56 @@ func (p *GovernancePlugin) embeddingExecutor() EmbeddingRequestExecutor {
 		return *ptr
 	}
 	return nil
+}
+
+// SetWarmupEmbedUsageObserver wires (or clears, with nil) the callback that
+// receives warmup embedding usage. Safe for concurrent use with warmup and
+// plugin reloads.
+func (p *GovernancePlugin) SetWarmupEmbedUsageObserver(observer WarmupEmbedUsageObserver) {
+	if observer == nil {
+		p.warmupEmbedUsageObserver.Store(nil)
+		return
+	}
+	p.warmupEmbedUsageObserver.Store(&observer)
+}
+
+// settleWarmupEmbedUsage settles one warmup embedding call: it reports the
+// usage to the wired observer (telemetry, always) and, when
+// count_toward_budgets is on, attributes the cost to the admin-owned
+// provider-level and global model-level budgets — the same ledger the tracker
+// uses for usage with no virtual key. Warmup has no triggering request, so no
+// VK/team/customer budget is ever touched: there is no tenant to bill, only
+// the platform-level budgets on the embedding provider/model. Called only from
+// paths with no triggering request.
+func (p *GovernancePlugin) settleWarmupEmbedUsage(semantic *complexity.SemanticConfig, inputTokens int) {
+	if semantic == nil {
+		return
+	}
+	if ptr := p.warmupEmbedUsageObserver.Load(); ptr != nil {
+		(*ptr)(string(semantic.Provider), semantic.EmbeddingModel, inputTokens)
+	}
+
+	if !semantic.CountTowardBudgets || p.modelCatalog == nil || p.store == nil {
+		return
+	}
+	provider := string(semantic.Provider)
+	model := semantic.EmbeddingModel
+	tokens := inputTokens
+	cost := p.modelCatalog.CalculateRoutingEmbeddingCost(&schemas.BifrostRoutingDebug{
+		ProviderUsed: &provider,
+		ModelUsed:    &model,
+		InputTokens:  &tokens,
+	}, nil)
+	if cost <= 0 {
+		return
+	}
+	ctx := p.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := p.store.UpdateProviderAndModelBudgetUsageInMemory(ctx, model, semantic.Provider, cost); err != nil && p.logger != nil {
+		p.logger.Error("failed to attribute warmup embedding cost to provider/model budgets: %v", err)
+	}
 }
 
 // CanClassifySemantically reports whether semantic classification is currently

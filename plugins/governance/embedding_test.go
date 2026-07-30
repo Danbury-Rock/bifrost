@@ -1,11 +1,17 @@
 package governance
 
 import (
+	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/configstore"
+	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
+	"github.com/maximhq/bifrost/framework/modelcatalog"
+	"github.com/maximhq/bifrost/framework/modelcatalog/datasheet"
 	"github.com/maximhq/bifrost/plugins/governance/complexity"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -196,6 +202,239 @@ func TestGenerateEmbeddingGuards(t *testing.T) {
 		_, _, err := plugin.generateEmbedding(ctx, testEmbeddingSemanticConfig(), "x")
 		require.ErrorContains(t, err, "executor is not configured")
 	})
+}
+
+func TestEmbedComplexityTextRecordsRoutingUsage(t *testing.T) {
+	plugin := &GovernancePlugin{}
+	plugin.SetEmbeddingRequestExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
+		return embeddingResponse(schemas.EmbeddingStruct{EmbeddingArray: []float64{1, 0}}, 42), nil
+	})
+
+	cfg := testEmbeddingSemanticConfig()
+	cfg.CountTowardBudgets = true
+
+	ctx := schemas.NewBifrostContext(t.Context(), schemas.NoDeadline)
+	defer ctx.Cancel()
+	_, err := plugin.embedComplexityText(ctx, cfg, "classify me")
+	require.NoError(t, err)
+
+	usage, ok := ctx.Value(routingEmbedUsageContextKey).(*routingEmbedUsage)
+	require.True(t, ok, "classification embed must record usage on the request context")
+	assert.Equal(t, "openai", usage.Provider)
+	assert.Equal(t, "text-embedding-3-small", usage.Model)
+	assert.Equal(t, 42, usage.InputTokens)
+	assert.True(t, usage.CountTowardBudgets)
+}
+
+// warmupObservation captures one WarmupEmbedUsageObserver invocation.
+type warmupObservation struct {
+	Provider    string
+	Model       string
+	InputTokens int
+}
+
+func TestEmbedComplexityTextWarmupPathObservesInsteadOfRecording(t *testing.T) {
+	plugin := &GovernancePlugin{}
+	plugin.SetEmbeddingRequestExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
+		return embeddingResponse(schemas.EmbeddingStruct{EmbeddingArray: []float64{1, 0}}, 42), nil
+	})
+	var observed []warmupObservation
+	plugin.SetWarmupEmbedUsageObserver(func(provider, model string, inputTokens int) {
+		observed = append(observed, warmupObservation{provider, model, inputTokens})
+	})
+
+	// Warmup's single-input fallback runs on plain background contexts, never a
+	// *schemas.BifrostContext — its embeds go to the warmup observer, not to
+	// request attribution.
+	_, err := plugin.embedComplexityText(t.Context(), testEmbeddingSemanticConfig(), "warmup exemplar")
+	require.NoError(t, err)
+	require.Len(t, observed, 1)
+	assert.Equal(t, warmupObservation{"openai", "text-embedding-3-small", 42}, observed[0])
+}
+
+func TestEmbedComplexityTextWarmupPathWithoutObserver(t *testing.T) {
+	plugin := &GovernancePlugin{}
+	plugin.SetEmbeddingRequestExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
+		return embeddingResponse(schemas.EmbeddingStruct{EmbeddingArray: []float64{1, 0}}, 42), nil
+	})
+
+	// No observer wired (SDK usage, or before the server wires it): the warmup
+	// path must still work and must not panic.
+	_, err := plugin.embedComplexityText(t.Context(), testEmbeddingSemanticConfig(), "warmup exemplar")
+	require.NoError(t, err)
+}
+
+func TestEmbedComplexityTextsObservesWarmupNeverRecordsRoutingUsage(t *testing.T) {
+	plugin := &GovernancePlugin{}
+	plugin.SetEmbeddingRequestExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
+		return &schemas.BifrostEmbeddingResponse{
+			Data: []schemas.EmbeddingData{
+				{Index: 0, Embedding: schemas.EmbeddingStruct{EmbeddingArray: []float64{1, 0}}},
+				{Index: 1, Embedding: schemas.EmbeddingStruct{EmbeddingArray: []float64{0, 1}}},
+			},
+			Usage: &schemas.BifrostLLMUsage{TotalTokens: 7},
+		}, nil
+	})
+	var observed []warmupObservation
+	plugin.SetWarmupEmbedUsageObserver(func(provider, model string, inputTokens int) {
+		observed = append(observed, warmupObservation{provider, model, inputTokens})
+	})
+
+	// Batch embeds are warmup-only: even on a request context they observe as
+	// warmup and never attribute usage — only per-request classification
+	// embeds do.
+	ctx := schemas.NewBifrostContext(t.Context(), schemas.NoDeadline)
+	defer ctx.Cancel()
+	_, err := plugin.embedComplexityTexts(ctx, testEmbeddingSemanticConfig(), []string{"a", "b"})
+	require.NoError(t, err)
+	assert.Nil(t, ctx.Value(routingEmbedUsageContextKey))
+	require.Len(t, observed, 1)
+	assert.Equal(t, warmupObservation{"openai", "text-embedding-3-small", 7}, observed[0])
+}
+
+func TestRequestClassificationEmbedDoesNotObserveWarmup(t *testing.T) {
+	plugin := &GovernancePlugin{}
+	plugin.SetEmbeddingRequestExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
+		return embeddingResponse(schemas.EmbeddingStruct{EmbeddingArray: []float64{1, 0}}, 42), nil
+	})
+	var observed []warmupObservation
+	plugin.SetWarmupEmbedUsageObserver(func(provider, model string, inputTokens int) {
+		observed = append(observed, warmupObservation{provider, model, inputTokens})
+	})
+
+	// A classification embed on a request context records usage for the
+	// RoutingDebug stamp; it must NOT also fire the warmup observer, or the
+	// request phase would double-count in telemetry.
+	ctx := schemas.NewBifrostContext(t.Context(), schemas.NoDeadline)
+	defer ctx.Cancel()
+	_, err := plugin.embedComplexityText(ctx, testEmbeddingSemanticConfig(), "classify me")
+	require.NoError(t, err)
+	assert.NotNil(t, ctx.Value(routingEmbedUsageContextKey))
+	assert.Empty(t, observed)
+}
+
+func TestStampRoutingDebug(t *testing.T) {
+	newCtxWithUsage := func(t *testing.T, countTowardBudgets bool) *schemas.BifrostContext {
+		t.Helper()
+		ctx := schemas.NewBifrostContext(t.Context(), schemas.NoDeadline)
+		t.Cleanup(ctx.Cancel)
+		ctx.SetValue(routingEmbedUsageContextKey, &routingEmbedUsage{
+			Provider:           "openai",
+			Model:              "text-embedding-3-small",
+			InputTokens:        42,
+			CountTowardBudgets: countTowardBudgets,
+		})
+		return ctx
+	}
+	newChatResult := func() *schemas.BifrostResponse {
+		return &schemas.BifrostResponse{ChatResponse: &schemas.BifrostChatResponse{}}
+	}
+
+	t.Run("stamps regardless of budget flag", func(t *testing.T) {
+		for _, flag := range []bool{false, true} {
+			result := newChatResult()
+			stampRoutingDebug(newCtxWithUsage(t, flag), result, schemas.ChatCompletionRequest, false)
+
+			rd := result.GetExtraFields().RoutingDebug
+			require.NotNil(t, rd, "routing debug must be stamped whenever a routing embed ran (flag=%v)", flag)
+			require.NotNil(t, rd.ProviderUsed)
+			assert.Equal(t, "openai", *rd.ProviderUsed)
+			require.NotNil(t, rd.ModelUsed)
+			assert.Equal(t, "text-embedding-3-small", *rd.ModelUsed)
+			require.NotNil(t, rd.InputTokens)
+			assert.Equal(t, 42, *rd.InputTokens)
+			assert.Equal(t, flag, rd.CountTowardBudgets)
+		}
+	})
+
+	t.Run("stream stamps only the final chunk", func(t *testing.T) {
+		ctx := newCtxWithUsage(t, false)
+
+		intermediate := newChatResult()
+		stampRoutingDebug(ctx, intermediate, schemas.ChatCompletionStreamRequest, false)
+		assert.Nil(t, intermediate.GetExtraFields().RoutingDebug)
+
+		final := newChatResult()
+		stampRoutingDebug(ctx, final, schemas.ChatCompletionStreamRequest, true)
+		assert.NotNil(t, final.GetExtraFields().RoutingDebug)
+	})
+
+	t.Run("no usage recorded means no stamp", func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(t.Context(), schemas.NoDeadline)
+		defer ctx.Cancel()
+		result := newChatResult()
+		stampRoutingDebug(ctx, result, schemas.ChatCompletionRequest, false)
+		assert.Nil(t, result.GetExtraFields().RoutingDebug)
+	})
+
+	t.Run("nil result is a no-op", func(t *testing.T) {
+		stampRoutingDebug(newCtxWithUsage(t, true), nil, schemas.ChatCompletionRequest, false)
+	})
+}
+
+// newOfflinePricingCatalog builds a ModelCatalog from the committed pricing
+// testdata via a file:// URL (no network). The testdata includes
+// text-embedding-3-small at $0.00000002 per input token.
+func newOfflinePricingCatalog(t *testing.T) *modelcatalog.ModelCatalog {
+	t.Helper()
+	abs, err := filepath.Abs("../../framework/modelcatalog/datasheet/testdata/pricing.json")
+	require.NoError(t, err)
+	ds := datasheet.New(nil, NewMockLogger(), datasheet.Config{URL: "file://" + abs})
+	require.NoError(t, ds.LoadFromURLIntoMemory(context.Background()))
+	return modelcatalog.NewTestCatalogWithDatasheet(ds)
+}
+
+// newWarmupBudgetFixture wires a plugin over a store whose "openai" provider
+// carries a provider-level budget — the admin-owned ledger warmup embeds are
+// attributed to when count_toward_budgets is on.
+func newWarmupBudgetFixture(t *testing.T) (*GovernancePlugin, GovernanceStore) {
+	t.Helper()
+	logger := NewMockLogger()
+	budget := buildBudgetWithUsage("provider-budget", 1000.0, 0.0, "1d")
+	budgetID := budget.ID
+	store, err := NewLocalGovernanceStore(context.Background(), logger, nil, &configstore.GovernanceConfig{
+		Budgets:   []configstoreTables.TableBudget{*budget},
+		Providers: []configstoreTables.TableProvider{{Name: "openai", BudgetID: &budgetID}},
+	}, nil)
+	require.NoError(t, err)
+	plugin := &GovernancePlugin{
+		ctx:          context.Background(),
+		store:        store,
+		modelCatalog: newOfflinePricingCatalog(t),
+		logger:       logger,
+	}
+	return plugin, store
+}
+
+func TestSettleWarmupEmbedUsageAttributesProviderBudget(t *testing.T) {
+	plugin, store := newWarmupBudgetFixture(t)
+	cfg := testEmbeddingSemanticConfig()
+	cfg.CountTowardBudgets = true
+
+	plugin.settleWarmupEmbedUsage(cfg, 1000)
+
+	// 1000 tokens × $0.00000002/token (text-embedding-3-small in testdata).
+	usage := store.GetGovernanceData(context.Background()).Budgets["provider-budget"].CurrentUsage
+	assert.InDelta(t, 0.00002, usage, 1e-12)
+}
+
+func TestSettleWarmupEmbedUsageFlagOffLeavesBudgetsUntouched(t *testing.T) {
+	plugin, store := newWarmupBudgetFixture(t)
+
+	// count_toward_budgets defaults to off: warmup cost stays telemetry-only.
+	plugin.settleWarmupEmbedUsage(testEmbeddingSemanticConfig(), 1000)
+
+	usage := store.GetGovernanceData(context.Background()).Budgets["provider-budget"].CurrentUsage
+	assert.Equal(t, 0.0, usage)
+}
+
+func TestSettleWarmupEmbedUsageWithoutStoreOrCatalog(t *testing.T) {
+	// Bare plugin (no store, no catalog, no observer): flag on must be a
+	// harmless no-op, not a panic — SDK callers may never wire these.
+	plugin := &GovernancePlugin{}
+	cfg := testEmbeddingSemanticConfig()
+	cfg.CountTowardBudgets = true
+	plugin.settleWarmupEmbedUsage(cfg, 1000)
 }
 
 func TestCanClassifySemantically(t *testing.T) {
