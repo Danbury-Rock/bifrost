@@ -12,3 +12,4 @@
 - fix: treat Bedrock's cross-account or cross-model encrypted reasoning rejection as recoverable and retry without it
 - fix: decision emulation uses tool_choice auto for gpt-oss on Bedrock Mantle, and recovers leaked parameter tags with surrounding whitespace
 - fix: report Gemini transcription usage even when the transcript is empty
+- fix: Anthropic web search on chat completions - server_tool_use input no longer leaks as orphan tool_calls stream deltas, and web_search_result_location citations map to url_citation annotations (streaming and non-streaming)
