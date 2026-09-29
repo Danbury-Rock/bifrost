@@ -241,3 +241,7 @@ require (
 	gorm.io/driver/clickhouse v0.7.0 // indirect
 	gorm.io/driver/postgres v1.6.0 // indirect
 )
+
+// DAN-1599: build against the in-repo core (carries the web-search chat patch), not the
+// published core module. core/ at transports/v2.2.3 is identical to core/v1.10.2 otherwise.
+replace github.com/maximhq/bifrost/core => ../core
